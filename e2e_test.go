@@ -74,6 +74,8 @@ func TestE2e(t *testing.T) {
 		})
 
 		if len(manualRemediations) > 0 {
+			// Wait some time after MachineConfigPool is ready to apply manual remediation
+			time.Sleep(60 * time.Second)
 			t.Run("Apply manual remediations", func(t *testing.T) {
 				ctx.applyManualRemediations(t, manualRemediations)
 			})
