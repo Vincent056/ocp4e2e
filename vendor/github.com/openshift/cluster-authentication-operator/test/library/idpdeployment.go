@@ -6,18 +6,17 @@ import (
 	"os"
 	"testing"
 
+	configv1 "github.com/openshift/api/config/v1"
+	routev1 "github.com/openshift/api/route/v1"
+	configv1client "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
+	routev1client "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
 	"github.com/stretchr/testify/require"
-
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/client-go/kubernetes"
-
-	configv1 "github.com/openshift/api/config/v1"
-	routev1 "github.com/openshift/api/route/v1"
-	configv1client "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
-	routev1client "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
 )
 
 const servingSecretName = "serving-secret"
@@ -25,7 +24,6 @@ const servingSecretName = "serving-secret"
 func boolptr(b bool) *bool {
 	return &b
 }
-
 func deployPod(
 	t *testing.T,
 	clients *kubernetes.Clientset,
@@ -69,54 +67,76 @@ func deployPod(
 		}
 	}()
 
-	pod := podTemplate(name, image, httpPort, httpsPort)
-	pod.Spec.Volumes = volumes
-	pod.Spec.Containers[0].VolumeMounts = volumeMounts
-	pod.Spec.Containers[0].Env = env
-	pod.Spec.Containers[0].Resources = resources
-	_, err = clients.CoreV1().Pods(namespace).Create(testContext, pod, metav1.CreateOptions{})
-	require.NoError(t, err)
+	deploymentsClient := clients.AppsV1().Deployments(namespace)
+	replicaHelper := int32(1)
 
-	_, err = clients.CoreV1().Services(namespace).Create(testContext, svcTemplate(httpPort, httpsPort), metav1.CreateOptions{})
-	require.NoError(t, err)
-
-	route, err := routeClient.Routes(namespace).Create(testContext, routeTemplate(useTLS), metav1.CreateOptions{})
-	require.NoError(t, err)
-
-	host, err = WaitForRouteAdmitted(t, routeClient, route.Name, route.Namespace)
-	require.NoError(t, err)
-
-	return
-}
-
-func podTemplate(name, image string, httpPort, httpsPort int32) *corev1.Pod {
-	return &corev1.Pod{
+	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-			Labels: map[string]string{
-				"app": "e2e-tested-app",
-			},
+			Name: "demo-deployment",
 		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:  "payload",
-					Image: image,
-					SecurityContext: &corev1.SecurityContext{
-						Privileged: boolptr(true),
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicaHelper,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": "keycloak",
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: name,
+					Labels: map[string]string{
+						"app": "e2e-tested-app",
 					},
-					Ports: []corev1.ContainerPort{
+				},
+				Spec: corev1.PodSpec{
+					Volumes: volumes,
+					Containers: []corev1.Container{
 						{
-							ContainerPort: httpsPort,
-						},
-						{
-							ContainerPort: httpPort,
+							Name:  "payload",
+							Image: image,
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: boolptr(true),
+							},
+							Ports: []corev1.ContainerPort{
+								{
+									ContainerPort: httpsPort,
+								},
+								{
+									ContainerPort: httpPort,
+								},
+							},
+							VolumeMounts: volumeMounts,
+							Env:          env,
+							Resources:    resources,
 						},
 					},
 				},
 			},
 		},
 	}
+
+	// Create Deployment
+	_, err = deploymentsClient.Create(context.TODO(), deployment, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	err = WaitForPodCreated(t, clients, "keycloak", namespace)
+	require.NoError(t, err)
+
+	_, err = clients.CoreV1().Services(namespace).Create(testContext, svcTemplate(httpPort, httpsPort), metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	cmCA, err := clients.CoreV1().ConfigMaps(namespace).Get(context.TODO(), "openshift-service-ca.crt", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	serviceCA := cmCA.Data["service-ca.crt"]
+
+	route, err := routeClient.Routes(namespace).Create(testContext, routeTemplate(useTLS, serviceCA), metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	host, err = WaitForRouteAdmitted(t, routeClient, route.Name, route.Namespace)
+	require.NoError(t, err)
+
+	return
 }
 
 func svcTemplate(httpPort, httpsPort int32) *corev1.Service {
@@ -146,7 +166,7 @@ func svcTemplate(httpPort, httpsPort int32) *corev1.Service {
 	}
 }
 
-func routeTemplate(useTLS bool) *routev1.Route {
+func routeTemplate(useTLS bool, destCA string) *routev1.Route {
 	r := &routev1.Route{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-route",
@@ -165,14 +185,13 @@ func routeTemplate(useTLS bool) *routev1.Route {
 			},
 		},
 	}
-
 	if useTLS {
 		r.Spec.TLS.Termination = routev1.TLSTerminationReencrypt
+		r.Spec.TLS.DestinationCACertificate = destCA
 		r.Spec.Port = &routev1.RoutePort{
 			TargetPort: intstr.FromString("https"),
 		}
 	}
-
 	return r
 }
 
@@ -252,7 +271,7 @@ func addOIDCIDentityProvider(t *testing.T, kubeClients *kubernetes.Clientset, co
 		}
 	})
 
-	caCMName := idpName + "-ca"
+	caCMName := "openshift-service-ca"
 	// configure the default ingress CA as the CA for the IdP in the openshift-config NS
 	cleanups = append(cleanups, SyncDefaultIngressCAToConfig(t, kubeClients.CoreV1(), caCMName))
 
@@ -300,6 +319,8 @@ func addIdentityProvider(t *testing.T, kubeClients *kubernetes.Clientset, config
 	cleanups = append(cleanups, func() {
 		CleanIDPConfigByName(t, configClient.OAuths(), idp.Name)
 	})
+
+	configClient.OAuths().Get(context.TODO(), "cluster", metav1.GetOptions{})
 
 	if err := WaitForOperatorToPickUpChanges(t, configClient, "authentication"); err != nil {
 		return cleanups, err

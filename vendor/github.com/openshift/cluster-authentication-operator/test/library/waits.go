@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 
 	configv1 "github.com/openshift/api/config/v1"
 	configv1client "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
@@ -58,7 +59,7 @@ func WaitForClusterOperatorStatus(t *testing.T, client configv1client.ConfigV1In
 		conditions := clusterOperator.Status.Conditions
 		t.Logf("clusteroperators.config.openshift.io/%v: %v", name, conditionsStatusString(conditions))
 		degradedCondition := v1helpers.FindStatusCondition(conditions, configv1.OperatorDegraded)
-		if degradedCondition.Status == configv1.ConditionTrue {
+		if degradedCondition != nil && degradedCondition.Status == configv1.ConditionTrue {
 			t.Logf("clusteroperators.config.openshift.io/%v: degraded is true!: %s:%s", name, degradedCondition.Reason, degradedCondition.Message)
 		}
 		availableStatusIsMatch, progressingStatusIsMatch, degradedStatusIsMatch, upgradableStatusIsMatch := true, true, true, true
@@ -115,6 +116,19 @@ func WaitForRouteAdmitted(t *testing.T, client routev1client.RouteV1Interface, n
 	})
 
 	return admittedURL, err
+}
+
+func WaitForPodCreated(t *testing.T, client *kubernetes.Clientset, name, ns string) error {
+	t.Logf("waiting for pod %s/%s to be created", ns, name)
+	err := wait.PollImmediate(time.Second, 2*time.Minute, func() (bool, error) {
+		_, err := client.CoreV1().Pods(ns).Get(context.TODO(), name, metav1.GetOptions{})
+		if err != nil {
+			t.Logf("pod.Get(%s/%s) error: %v", ns, name, err)
+			return false, nil
+		}
+		return true, nil
+	})
+	return err
 }
 
 func WaitForHTTPStatus(t *testing.T, waitDuration time.Duration, client *http.Client, targetURL string, expectedStatus int) error {
